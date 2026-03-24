@@ -39,10 +39,10 @@ export const PulsingCircle: React.FC<PulsingCircleProps> = ({ active }) => {
           borderRadius: "50%",
           background: active
             ? "radial-gradient(circle at 35% 35%, #FB923C 0%, #F97316 40%, #EA580C 80%, #C2410C 100%)"
-            : "radial-gradient(circle at 35% 35%, #525252 0%, #404040 40%, #333333 80%, #262626 100%)",
+            : "radial-gradient(circle at 35% 35%, #D1D5DB 0%, #9CA3AF 40%, #6B7280 80%, #4B5563 100%)",
           boxShadow: active
-            ? "0 0 60px rgba(249, 115, 22, 0.35), 0 0 120px rgba(249, 115, 22, 0.15), inset 0 -4px 12px rgba(0,0,0,0.3)"
-            : "0 0 20px rgba(0,0,0,0.3), inset 0 -4px 12px rgba(0,0,0,0.3)",
+            ? "0 0 60px rgba(249, 115, 22, 0.25), 0 0 120px rgba(249, 115, 22, 0.1), inset 0 -4px 12px rgba(0,0,0,0.15)"
+            : "0 0 20px rgba(0,0,0,0.1), inset 0 -4px 12px rgba(0,0,0,0.1)",
           animation: active ? "ambient-pulse 2s ease-in-out infinite" : "none",
           transition: "box-shadow 0.4s ease, background 0.4s ease",
         }}

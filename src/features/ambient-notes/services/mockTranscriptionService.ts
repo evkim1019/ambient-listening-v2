@@ -52,3 +52,22 @@ export async function transcribeAudio(
     segments: DUMMY_SEGMENTS,
   };
 }
+/** Key clinical phrases to highlight in the transcript — patient visit context, not legal terms. */
+export const KEY_TAKEAWAY_PHRASES: string[] = [
+  "anxiety",
+  "dark thoughts",
+  "scared me",
+  "drinking more",
+  "home life is stable",
+  "weighing on me",
+  "complications",
+  "adjust your medication",
+  "behavioral health specialist",
+  "comprehensive plan",
+  "palliative options",
+  "reproductive health concerns",
+  "persistent",
+  "refer you to",
+  "follow-up",
+  "safety planning",
+];

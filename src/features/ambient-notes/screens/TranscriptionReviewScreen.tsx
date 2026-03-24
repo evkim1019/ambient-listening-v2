@@ -1,40 +1,57 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useAmbientNotes } from "../context/AmbientNotesContext";
-import { transcribeAudio } from "../services/mockTranscriptionService";
-import { scanForComplianceFlags } from "../services/mockComplianceService";
+import { transcribeAudio, KEY_TAKEAWAY_PHRASES } from "../services/mockTranscriptionService";
+import { scanForComplianceFlags, scanNoteForLegalFlags } from "../services/mockComplianceService";
 import { generateNote } from "../services/mockNoteGeneratorService";
-import { analyzeNoteForGaps } from "../services/mockGapIdentifierService";
-import { ComplianceHighlight } from "../components/ComplianceHighlight";
-import { RecommendedSentence } from "../components/RecommendedSentence";
-import { GapNotificationPanel } from "../components/GapNotificationPanel";
+import type { NoteGenerationOptions } from "../services/mockNoteGeneratorService";
 import { LoadingIndicator } from "../components/LoadingIndicator";
 import { ErrorRetry } from "../components/ErrorRetry";
-import { TemplateDropdown } from "../components/TemplateDropdown";
-import type { NoteGenerationOptions } from "../services/mockNoteGeneratorService";
-import type { ComplianceFlag, DocumentationGap } from "../types";
+import { TEMPLATE_SECTIONS } from "../data/templates";
+import { purgeBuffer } from "../services/volatileAudioBuffer";
+import type { ComplianceFlag, TemplateName } from "../types";
 
-type ScreenPhase = "transcribing" | "ready" | "generating" | "editing" | "error";
+/* ---- Insurance coverage recommendation items based on EHR audit checklist ---- */
+const COVERAGE_RECOMMENDATIONS = [
+  { id: "cc", label: "Chief Complaint", text: "Chief Complaint: [Document patient's primary reason for visit in their own words]", keywords: ["chief complaint", "reason for visit", "presenting concern"] },
+  { id: "hpi", label: "History of Present Illness", text: "HPI: Onset, location, duration, character, aggravating/relieving factors, timing, and severity documented.", keywords: ["history of present illness", "hpi:", "onset", "duration", "aggravating"] },
+  { id: "ros", label: "Review of Systems", text: "ROS: Constitutional, psychiatric, neurological systems reviewed. Pertinent negatives documented.", keywords: ["review of systems", "ros:", "pertinent negatives", "denies dyspnea", "denies chest pain"] },
+  { id: "pe", label: "Physical Examination", text: "Physical Exam: Vital signs recorded. System-specific findings with pertinent negatives noted.", keywords: ["physical exam", "vital signs", "bp ", "hr ", "temp ", "physical examination"] },
+  { id: "mdm", label: "Medical Decision Making", text: "MDM: Number of diagnoses/management options, data reviewed, and risk of complications documented.", keywords: ["medical decision making", "mdm:", "differential diagnos", "risk of complications"] },
+  { id: "dx", label: "Diagnosis with ICD-10", text: "Assessment: [Primary diagnosis] — ICD-10: [code]. Differential diagnoses considered.", keywords: ["icd-10", "icd10", "diagnosis:", "assessment:"] },
+  { id: "plan", label: "Treatment Plan", text: "Plan: Medications prescribed, dosage, frequency. Referrals ordered. Follow-up scheduled in [X] weeks.", keywords: ["plan:", "medications prescribed", "referrals ordered", "follow-up scheduled"] },
+  { id: "time", label: "Time Documentation", text: "Total face-to-face time: [X] minutes. Counseling/coordination comprised >50% of encounter.", keywords: ["face-to-face time", "total time", "minutes spent", "counseling/coordination"] },
+  { id: "consent", label: "Informed Consent", text: "Risks, benefits, and alternatives discussed. Patient verbalized understanding and consented to treatment plan.", keywords: ["informed consent", "risks, benefits", "consented to", "verbalized understanding"] },
+  { id: "safety", label: "Safety Assessment", text: "Safety assessment completed. Patient denies SI/HI. Safety plan reviewed and updated.", keywords: ["safety assessment", "safety plan", "denies si", "denies hi", "suicidal ideation"] },
+];
+
+type ScreenPhase = "transcribing" | "ready" | "error";
 
 export default function TranscriptionReviewScreen() {
   const navigate = useNavigate();
   const {
     transcription, setTranscription,
     complianceFlags, setComplianceFlags,
-    templateEnabled, setTemplateEnabled,
     selectedTemplate, setSelectedTemplate,
-    generatedNote, setGeneratedNote,
-    editedNoteContent, setEditedNoteContent,
-    documentationGaps, setDocumentationGaps,
+    setGeneratedNote, setEditedNoteContent,
+    setDataRetentionConfirmed,
+    setAttestationCompleted, setAttestationTimestamp,
   } = useAmbientNotes();
 
   const [phase, setPhase] = useState<ScreenPhase>("transcribing");
   const [errorMessage, setErrorMessage] = useState("");
-  const [highlightRange, setHighlightRange] = useState<{ start: number; end: number } | null>(null);
-
-  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const highlightTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const [noteContent, setNoteContent] = useState("");
+  const [isGenerating, setIsGenerating] = useState(false);
+  const [hasGeneratedSinceEdit, setHasGeneratedSinceEdit] = useState(false);
+  const [legalReviewEnabled, setLegalReviewEnabled] = useState(true);
+  const [coverageRecsEnabled, setCoverageRecsEnabled] = useState(false);
+  const [noteLegalFlags, setNoteLegalFlags] = useState<ComplianceFlag[]>([]);
+  const [showFinalizeModal, setShowFinalizeModal] = useState(false);
+  const [purgeData, setPurgeData] = useState(true);
+  const [attestChecked, setAttestChecked] = useState(false);
+  const [showTemplateMenu, setShowTemplateMenu] = useState(false);
+  const templateMenuRef = useRef<HTMLDivElement>(null);
+  const legalDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   /* ---- Transcription ---- */
 
@@ -55,326 +72,326 @@ export default function TranscriptionReviewScreen() {
 
   useEffect(() => { doTranscribe(); }, [doTranscribe]);
 
-  /* ---- Compliance flag handlers ---- */
+  /* ---- Close template menu on outside click ---- */
 
-  const handleToggleFlag = useCallback((id: string) => {
-    setComplianceFlags(complianceFlags.map((f) =>
-      f.id === id ? { ...f, enabled: !f.enabled } : f
-    ));
-  }, [complianceFlags, setComplianceFlags]);
+  useEffect(() => {
+    const handleClickOutside = (e: MouseEvent) => {
+      if (templateMenuRef.current && !templateMenuRef.current.contains(e.target as Node)) {
+        setShowTemplateMenu(false);
+      }
+    };
+    if (showTemplateMenu) document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, [showTemplateMenu]);
 
-  const handleEditReplacement = useCallback((id: string, newReplacement: string) => {
-    setComplianceFlags(complianceFlags.map((f) =>
-      f.id === id ? { ...f, replacement: newReplacement } : f
-    ));
-  }, [complianceFlags, setComplianceFlags]);
+  /* ---- Transcript rendering with clinical key points ---- */
 
-  const enabledCount = complianceFlags.filter((f) => f.enabled).length;
-  const allEnabled = complianceFlags.length > 0 && enabledCount === complianceFlags.length;
+  const renderTranscript = useMemo(() => {
+    if (!transcription) return null;
+    type HRange = { start: number; end: number };
+    const ranges: HRange[] = [];
+    const lowerText = transcription.toLowerCase();
+    for (const phrase of KEY_TAKEAWAY_PHRASES) {
+      let from = 0;
+      const lp = phrase.toLowerCase();
+      while (true) {
+        const idx = lowerText.indexOf(lp, from);
+        if (idx === -1) break;
+        ranges.push({ start: idx, end: idx + phrase.length });
+        from = idx + phrase.length;
+      }
+    }
+    ranges.sort((a, b) => a.start - b.start);
+    // Merge overlapping
+    const merged: HRange[] = [];
+    for (const r of ranges) {
+      if (merged.length > 0 && r.start <= merged[merged.length - 1].end) {
+        merged[merged.length - 1].end = Math.max(merged[merged.length - 1].end, r.end);
+      } else {
+        merged.push({ ...r });
+      }
+    }
+    const nodes: React.ReactNode[] = [];
+    let cursor = 0;
+    for (let i = 0; i < merged.length; i++) {
+      const r = merged[i];
+      if (cursor < r.start) nodes.push(<span key={`t-${cursor}`}>{transcription.substring(cursor, r.start)}</span>);
+      nodes.push(<span key={`h-${i}`} style={takeawayHighlightStyle}>{transcription.substring(r.start, r.end)}</span>);
+      cursor = r.end;
+    }
+    if (cursor < transcription.length) nodes.push(<span key={`t-${cursor}`}>{transcription.substring(cursor)}</span>);
+    return nodes;
+  }, [transcription]);
 
-  const handleToggleAll = useCallback(() => {
-    const newEnabled = !allEnabled;
-    setComplianceFlags(complianceFlags.map((f) => ({ ...f, enabled: newEnabled })));
-  }, [allEnabled, complianceFlags, setComplianceFlags]);
+  /* ---- Add AI note ---- */
 
-  /* ---- Note generation ---- */
-
-  const handleGenerateNote = useCallback(async () => {
-    setPhase("generating");
+  const handleSelectTemplateAndGenerate = useCallback(async (template: TemplateName) => {
+    setSelectedTemplate(template);
+    setShowTemplateMenu(false);
+    setIsGenerating(true);
     setErrorMessage("");
     try {
-      const options: NoteGenerationOptions = {
-        transcription,
-        template: selectedTemplate || undefined,
-        complianceFlags,
-      };
+      const options: NoteGenerationOptions = { transcription, template, complianceFlags };
       const result = await generateNote(options);
       setGeneratedNote(result);
-      setEditedNoteContent(templateEnabled ? result.content : "");
-      setPhase("editing");
-      if (templateEnabled && result.content) {
-        runGapAnalysis(result.content);
+      const newContent = noteContent ? noteContent + "\n\n" + result.content : result.content;
+      setNoteContent(newContent);
+      setEditedNoteContent(newContent);
+      setHasGeneratedSinceEdit(true);
+      setCoverageRecsEnabled(true);
+      // Trigger immediate legal scan on the new content
+      if (legalReviewEnabled) {
+        setNoteLegalFlags(scanNoteForLegalFlags(newContent));
       }
     } catch (err) {
       setErrorMessage(err instanceof Error ? err.message : "Note generation failed.");
-      setPhase("error");
+    } finally {
+      setIsGenerating(false);
     }
-  }, [transcription, selectedTemplate, complianceFlags, templateEnabled, setGeneratedNote, setEditedNoteContent]);
+  }, [transcription, complianceFlags, noteContent, setSelectedTemplate, setGeneratedNote, setEditedNoteContent]);
 
-  /* ---- Editor helpers ---- */
+  const canAddAINote = !isGenerating && !hasGeneratedSinceEdit;
 
-  const hasComplianceMappings = complianceFlags.some((f) => f.enabled);
+  /* ---- Note content change ---- */
 
-  const flashHighlight = useCallback((start: number, end: number) => {
-    if (highlightTimerRef.current) clearTimeout(highlightTimerRef.current);
-    setHighlightRange({ start, end });
-    highlightTimerRef.current = setTimeout(() => setHighlightRange(null), 1500);
-  }, []);
+  const handleNoteChange = useCallback((value: string) => {
+    setNoteContent(value);
+    setEditedNoteContent(value);
+    setHasGeneratedSinceEdit(false);
+    if (legalReviewEnabled) {
+      if (legalDebounceRef.current) clearTimeout(legalDebounceRef.current);
+      legalDebounceRef.current = setTimeout(() => setNoteLegalFlags(scanNoteForLegalFlags(value)), 500);
+    }
+  }, [setEditedNoteContent, legalReviewEnabled]);
 
-  const runGapAnalysis = useCallback(async (content: string) => {
-    try {
-      const result = await analyzeNoteForGaps(content, selectedTemplate || undefined);
-      setDocumentationGaps(result.gaps);
-    } catch { setDocumentationGaps([]); }
-  }, [selectedTemplate, setDocumentationGaps]);
+  /* ---- Toggle legal review ---- */
 
-  const handleContentChange = useCallback((newContent: string) => {
+  const handleToggleLegalReview = useCallback((enabled: boolean) => {
+    setLegalReviewEnabled(enabled);
+    if (enabled && noteContent) setNoteLegalFlags(scanNoteForLegalFlags(noteContent));
+    else if (!enabled) setNoteLegalFlags([]);
+  }, [noteContent]);
+
+  /* ---- Accept legal suggestion ---- */
+
+  const handleAcceptLegalSuggestion = useCallback((flag: ComplianceFlag) => {
+    const regex = new RegExp(escapeRegExpLocal(flag.original), "gi");
+    const updated = noteContent.replace(regex, flag.replacement);
+    setNoteContent(updated);
+    setEditedNoteContent(updated);
+    setNoteLegalFlags(scanNoteForLegalFlags(updated));
+  }, [noteContent, setEditedNoteContent]);
+
+  /* ---- Add coverage recommendation ---- */
+
+  const handleAddCoverageRec = useCallback((text: string) => {
+    const newContent = noteContent ? noteContent + "\n\n" + text : text;
+    setNoteContent(newContent);
     setEditedNoteContent(newContent);
-    if (debounceRef.current) clearTimeout(debounceRef.current);
-    debounceRef.current = setTimeout(() => runGapAnalysis(newContent), 800);
-  }, [setEditedNoteContent, runGapAnalysis]);
+    setHasGeneratedSinceEdit(false);
+  }, [noteContent, setEditedNoteContent]);
 
-  const handleAddSuggestion = useCallback((gap: DocumentationGap) => {
-    const prefix = editedNoteContent ? editedNoteContent + "\n" : "";
-    const insertStart = prefix.length;
-    const newContent = prefix + gap.suggestedText;
-    setEditedNoteContent(newContent);
-    flashHighlight(insertStart, newContent.length);
-    setDocumentationGaps(documentationGaps.filter((g) => g.id !== gap.id));
-    if (debounceRef.current) clearTimeout(debounceRef.current);
-    debounceRef.current = setTimeout(() => runGapAnalysis(newContent), 800);
-  }, [editedNoteContent, setEditedNoteContent, documentationGaps, setDocumentationGaps, runGapAnalysis, flashHighlight]);
+  /* ---- Finalize modal ---- */
 
-  const handleInsertSentence = useCallback((sentence: string) => {
-    const prefix = editedNoteContent ? editedNoteContent + " " : "";
-    const insertStart = prefix.length;
-    const newContent = prefix + sentence;
-    handleContentChange(newContent);
-    flashHighlight(insertStart, newContent.length);
-  }, [editedNoteContent, handleContentChange, flashHighlight]);
+  const handleFinalize = () => setShowFinalizeModal(true);
 
-  const handleFinalize = () => navigate("/ambient-notes/retention");
+  const handleConfirmFinalize = () => {
+    if (purgeData) {
+      purgeBuffer();
+      setDataRetentionConfirmed(false);
+    } else {
+      setDataRetentionConfirmed(true);
+    }
+    setAttestationCompleted(true);
+    setAttestationTimestamp(new Date().toISOString());
+    setShowFinalizeModal(false);
+    navigate("/ambient-notes/export");
+  };
 
   useEffect(() => {
-    return () => {
-      if (debounceRef.current) clearTimeout(debounceRef.current);
-      if (highlightTimerRef.current) clearTimeout(highlightTimerRef.current);
-    };
+    return () => { if (legalDebounceRef.current) clearTimeout(legalDebounceRef.current); };
   }, []);
-
-  /* ---- Compliance preview renderer ---- */
-
-  const renderComplianceDraft = () => {
-    if (!generatedNote?.complianceMappings || generatedNote.complianceMappings.length === 0) return null;
-    const mappings = generatedNote.complianceMappings;
-    const parts: React.ReactNode[] = [];
-    let remaining = editedNoteContent;
-    let keyIdx = 0;
-    while (remaining.length > 0) {
-      let earliestIndex = -1;
-      let earliestMapping: (typeof mappings)[0] | null = null;
-      for (const mapping of mappings) {
-        const idx = remaining.toLowerCase().indexOf(mapping.replacement.toLowerCase());
-        if (idx !== -1 && (earliestIndex === -1 || idx < earliestIndex)) {
-          earliestIndex = idx;
-          earliestMapping = mapping;
-        }
-      }
-      if (earliestIndex === -1 || !earliestMapping) { parts.push(<span key={keyIdx++}>{remaining}</span>); break; }
-      if (earliestIndex > 0) parts.push(<span key={keyIdx++}>{remaining.substring(0, earliestIndex)}</span>);
-      parts.push(
-        <ComplianceHighlight key={keyIdx++}
-          modifiedText={remaining.substring(earliestIndex, earliestIndex + earliestMapping.replacement.length)}
-          originalText={earliestMapping.original} />
-      );
-      remaining = remaining.substring(earliestIndex + earliestMapping.replacement.length);
-    }
-    return (
-      <div style={complianceDraftStyle}>
-        <div style={complianceLabelStyle}>Compliance Preview</div>
-        <div style={{ fontSize: 14, lineHeight: 1.7, color: "var(--text-secondary)", whiteSpace: "pre-wrap" }}>{parts}</div>
-      </div>
-    );
-  };
-
-  /* ---- Highlight overlay renderer ---- */
-
-  const renderHighlightedEditor = () => {
-    if (!highlightRange) return null;
-    const before = editedNoteContent.substring(0, highlightRange.start);
-    const highlighted = editedNoteContent.substring(highlightRange.start, highlightRange.end);
-    const after = editedNoteContent.substring(highlightRange.end);
-    return (
-      <div style={highlightOverlayStyle} aria-hidden="true">
-        <span style={{ visibility: "hidden", whiteSpace: "pre-wrap" }}>{before}</span>
-        <span style={highlightedTextStyle}>{highlighted}</span>
-        <span style={{ visibility: "hidden", whiteSpace: "pre-wrap" }}>{after}</span>
-      </div>
-    );
-  };
 
   /* ---- Loading / error states ---- */
 
-  if (phase === "transcribing") {
-    return <div style={centeredStyle}><LoadingIndicator message="Transcribing audio..." /></div>;
-  }
-  if (phase === "generating") {
-    return <div style={centeredStyle}><LoadingIndicator message="Generating clinical note..." /></div>;
-  }
-  if (phase === "error") {
-    return (
-      <div style={centeredStyle}>
-        <ErrorRetry message={errorMessage} onRetry={errorMessage.includes("Transcription") ? doTranscribe : handleGenerateNote} />
-      </div>
-    );
-  }
-
-  /* ---- Right panel: config (ready) or editor (editing) ---- */
-
-  const renderRightPanel = () => {
-    if (phase === "editing") {
-      return renderEditorPanel();
-    }
-    return renderConfigPanel();
-  };
-
-  const renderConfigPanel = () => (
-    <>
-      {/* Flagged Terms */}
-      {complianceFlags.length > 0 && (
-        <div style={flagsSectionStyle}>
-          <div style={flagsHeaderStyle}>
-            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-              <div style={labelStyle}>Flagged Terms</div>
-              <span style={badgeStyle}>{enabledCount}/{complianceFlags.length}</span>
-            </div>
-            <label style={masterCheckboxStyle}>
-              <input type="checkbox" checked={allEnabled} onChange={handleToggleAll}
-                style={{ width: 14, height: 14, accentColor: "var(--accent)", cursor: "pointer" }} />
-              <span style={{ fontSize: 11, color: "var(--text-muted)" }}>All</span>
-            </label>
-          </div>
-          <div style={flagsListStyle}>
-            {complianceFlags.map((flag) => (
-              <FlagItem key={flag.id} flag={flag} onToggle={handleToggleFlag} onEditReplacement={handleEditReplacement} />
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* Template & Options */}
-      <div style={controlsSectionStyle}>
-        <div style={sectionStyle}>
-          <div style={labelStyle}>Template</div>
-          <TemplateDropdown value={selectedTemplate} onChange={setSelectedTemplate} />
-        </div>
-        <div style={sectionStyle}>
-          <ToggleSwitch label="Start with pre-written note" checked={templateEnabled} onChange={setTemplateEnabled} />
-          <p style={hintStyle}>Notes that are generated by AI can be denied by insurance company</p>
-        </div>
-        <button onClick={handleGenerateNote} style={generateBtnStyle}>Generate Note</button>
-      </div>
-    </>
-  );
-
-  const renderEditorPanel = () => {
-    if (templateEnabled) {
-      /* Template mode: compliance preview + textarea */
-      return (
-        <div style={editorPanelStyle}>
-          <div style={labelStyle}>Clinical Note</div>
-          {hasComplianceMappings && renderComplianceDraft()}
-          <textarea ref={textareaRef} value={editedNoteContent}
-            onChange={(e) => handleContentChange(e.target.value)}
-            placeholder="Edit your clinical note..." style={textareaStyle} rows={18} />
-          <button onClick={handleFinalize} style={finalizeBtnStyle}>Finalize Note</button>
-        </div>
-      );
-    }
-
-    /* Blank mode: textarea + recommendations, gap panel below */
-    return (
-      <div style={editorPanelStyle}>
-        <div style={labelStyle}>Compose Note</div>
-        <div style={editorWrapperStyle}>
-          {renderHighlightedEditor()}
-          <textarea ref={textareaRef} value={editedNoteContent}
-            onChange={(e) => handleContentChange(e.target.value)}
-            placeholder="Start writing your clinical note..." style={textareaStyle} rows={14} />
-        </div>
-
-        {generatedNote?.recommendedSentences && generatedNote.recommendedSentences.length > 0 && (
-          <div style={recsContainerStyle}>
-            <div style={recsLabelStyle}>Recommended Sentences</div>
-            <div style={recsListStyle}>
-              {generatedNote.recommendedSentences.map((sentence, idx) => (
-                <RecommendedSentence key={idx} sentence={sentence} onInsert={handleInsertSentence} />
-              ))}
-            </div>
-            {hasComplianceMappings && generatedNote.complianceMappings && generatedNote.complianceMappings.length > 0 && (
-              <p style={{ margin: 0, fontSize: 11, color: "var(--warning)", fontStyle: "italic" }}>
-                Compliance modifications applied to sentences.
-              </p>
-            )}
-          </div>
-        )}
-
-        <div style={gapPanelWrapperStyle}>
-          <GapNotificationPanel gaps={documentationGaps} onAddSuggestion={handleAddSuggestion} />
-        </div>
-
-        <button onClick={handleFinalize} style={finalizeBtnStyle}>Finalize Note</button>
-      </div>
-    );
-  };
+  if (phase === "transcribing") return <div style={centeredStyle}><LoadingIndicator message="Transcribing audio..." /></div>;
+  if (phase === "error" && !noteContent) return <div style={centeredStyle}><ErrorRetry message={errorMessage} onRetry={doTranscribe} /></div>;
 
   /* ---- Main render ---- */
 
   return (
     <div style={pageStyle}>
       <div style={headerStyle}>
-        <h2 style={headingStyle}>{phase === "editing" ? "Review & Edit Note" : "Review Transcription"}</h2>
-        <p style={subStyle}>
-          {phase === "editing"
-            ? "Edit your note while referencing the original transcription on the left."
-            : "Verify the transcription, review flagged terms, and configure note generation."}
-        </p>
+        <h2 style={headingStyle}>Review & Document</h2>
+        <p style={subStyle}>Reference the transcription while composing your patient note.</p>
       </div>
 
       <div style={twoColumnStyle}>
-        {/* LEFT: Transcription — always visible */}
+        {/* LEFT: Transcription */}
         <div style={leftColumnStyle}>
-          <div style={labelStyle}>Transcription</div>
-          <div style={transcriptionBoxStyle}>{transcription}</div>
+          <div style={panelHeaderStyle}>
+            <div style={labelStyle}>Transcription</div>
+            <div style={legendStyle}>
+              <span style={legendDotTakeaway} /> Key points
+            </div>
+          </div>
+          <div style={transcriptionBoxStyle}>{renderTranscript}</div>
         </div>
 
-        {/* RIGHT: Config or Editor */}
+        {/* RIGHT: Patient Note */}
         <div style={rightColumnStyle}>
-          {renderRightPanel()}
+          <div style={panelHeaderStyle}>
+            <div style={sectionTitleStyle}>Patient Note</div>
+          </div>
+
+          {/* Add AI note button with template dropdown */}
+          <div style={{ position: "relative" }} ref={templateMenuRef}>
+            <button
+              onClick={() => { if (canAddAINote) setShowTemplateMenu(!showTemplateMenu); }}
+              disabled={!canAddAINote}
+              style={{ ...addNoteBtnStyle, opacity: canAddAINote ? 1 : 0.4, cursor: canAddAINote ? "pointer" : "not-allowed" }}>
+              {isGenerating ? "Generating..." : "+ Add AI Note"}
+              {!isGenerating && <span style={chevronStyle}>▾</span>}
+            </button>
+            {showTemplateMenu && (
+              <div style={templateMenuStyle}>
+                {(Object.keys(TEMPLATE_SECTIONS) as TemplateName[]).map((name) => (
+                  <button key={name} onClick={() => handleSelectTemplateAndGenerate(name)}
+                    style={{
+                      ...templateMenuItemStyle,
+                      backgroundColor: name === selectedTemplate ? "var(--accent-soft)" : "transparent",
+                      color: name === selectedTemplate ? "var(--accent)" : "var(--text-secondary)",
+                    }}>
+                    {name}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+          {!canAddAINote && !isGenerating && (
+            <p style={hintStyle}>Edit the note to add another AI-generated section.</p>
+          )}
+
+          {/* Note textarea + coverage recs inside */}
+          <div style={noteAreaWrapperStyle}>
+            <textarea value={noteContent}
+              onChange={(e) => handleNoteChange(e.target.value)}
+              placeholder="Start writing or add an AI-generated note above..."
+              style={textareaStyle} rows={16} />
+
+            {/* Coverage recommendations inside bottom of textarea area */}
+            {coverageRecsEnabled && (() => {
+              const lowerNote = noteContent.toLowerCase();
+              const visible = COVERAGE_RECOMMENDATIONS.filter(
+                (rec) => !rec.keywords.some((kw) => lowerNote.includes(kw))
+              );
+              if (visible.length === 0) return (
+                <div style={coverageRecsInsideStyle}>
+                  <p style={{ margin: 0, fontSize: 12, color: "var(--success)", fontWeight: 500 }}>✓ Looking good — all key coverage areas are addressed in this note.</p>
+                </div>
+              );
+              return (
+                <div style={coverageRecsInsideStyle}>
+                  <div style={coverageRecsLabelStyle}>Insurance Coverage Recommendations</div>
+                  <div style={coverageRecsListStyle}>
+                    {visible.map((rec) => (
+                      <button key={rec.id} onClick={() => handleAddCoverageRec(rec.text)} style={coverageRecBtnStyle}>
+                        + {rec.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              );
+            })()}
+          </div>
+
+          {/* Toggles section */}
+          <div style={togglesSectionStyle}>
+            <ToggleSwitch label="Live Legal Review" checked={legalReviewEnabled} onChange={handleToggleLegalReview} />
+            {legalReviewEnabled && noteLegalFlags.length > 0 && (
+              <div style={legalSuggestionsStyle}>
+                {noteLegalFlags.map((flag) => (
+                  <LegalSuggestionItem key={flag.id} flag={flag} onAccept={handleAcceptLegalSuggestion} />
+                ))}
+              </div>
+            )}
+            {legalReviewEnabled && noteLegalFlags.length === 0 && noteContent.length > 0 && (
+              <p style={{ margin: 0, fontSize: 12, color: "var(--success)" }}>No legal concerns detected.</p>
+            )}
+
+            <div style={toggleDividerStyle} />
+
+            <ToggleSwitch label="AI Recommendations for Insurance Coverage" checked={coverageRecsEnabled} onChange={setCoverageRecsEnabled} />
+          </div>
+
+          {errorMessage && <p style={{ margin: 0, fontSize: 13, color: "var(--error)" }}>{errorMessage}</p>}
+
+          <button onClick={handleFinalize} disabled={!noteContent.trim()}
+            style={{ ...finalizeBtnStyle, opacity: noteContent.trim() ? 1 : 0.4, cursor: noteContent.trim() ? "pointer" : "not-allowed" }}>
+            Finalize Note
+          </button>
         </div>
       </div>
+
+      {/* Finalize Modal: Data Retention + Attestation */}
+      {showFinalizeModal && (
+        <div style={modalOverlayStyle} onClick={() => setShowFinalizeModal(false)}>
+          <div style={modalContentStyle} onClick={(e) => e.stopPropagation()}>
+            <h3 style={modalTitleStyle}>Finalize & Submit</h3>
+
+            <div style={modalSectionStyle}>
+              <div style={modalSectionLabelStyle}>🔒 Data Retention</div>
+              <p style={modalBodyStyle}>
+                Raw audio and transcription data is held in volatile memory. Choose whether to retain or purge it.
+              </p>
+              <label style={modalCheckboxRowStyle}>
+                <input type="checkbox" checked={purgeData} onChange={(e) => setPurgeData(e.target.checked)}
+                  style={modalCheckboxStyle} />
+                <span style={{ fontSize: 13, color: "var(--text-secondary)" }}>Purge raw audio and transcription data</span>
+              </label>
+            </div>
+
+            <div style={modalDividerStyle} />
+
+            <div style={modalSectionStyle}>
+              <div style={modalSectionLabelStyle}>✍️ Clinician Attestation</div>
+              <p style={modalBodyStyle}>
+                I attest that this clinical note accurately represents the patient encounter and is my own work product.
+              </p>
+              <label style={modalCheckboxRowStyle}>
+                <input type="checkbox" checked={attestChecked} onChange={(e) => setAttestChecked(e.target.checked)}
+                  style={modalCheckboxStyle} />
+                <span style={{ fontSize: 13, color: "var(--text-secondary)" }}>I confirm the above attestation</span>
+              </label>
+            </div>
+
+            <button onClick={handleConfirmFinalize} disabled={!attestChecked}
+              style={{
+                ...modalSubmitBtnStyle,
+                opacity: attestChecked ? 1 : 0.4,
+                cursor: attestChecked ? "pointer" : "not-allowed",
+              }}>
+              Sign & Export
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
 
 
-/* ---------- FlagItem ---------- */
+/* ---------- LegalSuggestionItem ---------- */
 
-function FlagItem({
-  flag, onToggle, onEditReplacement,
-}: {
-  flag: ComplianceFlag;
-  onToggle: (id: string) => void;
-  onEditReplacement: (id: string, value: string) => void;
-}) {
+function LegalSuggestionItem({ flag, onAccept }: { flag: ComplianceFlag; onAccept: (flag: ComplianceFlag) => void }) {
   return (
-    <div style={{
-      ...flagItemStyle,
-      opacity: flag.enabled ? 1 : 0.5,
-      borderColor: flag.enabled ? "var(--accent)" : "var(--border)",
-    }}>
-      <div style={flagTopRowStyle}>
-        <input type="checkbox" checked={flag.enabled} onChange={() => onToggle(flag.id)}
-          style={{ width: 15, height: 15, accentColor: "var(--accent)", cursor: "pointer", flexShrink: 0 }} />
-        <span style={flagOriginalStyle}>"{flag.original}"</span>
+    <div style={legalItemStyle}>
+      <div style={{ flex: 1 }}>
+        <span style={{ fontSize: 12, color: "var(--warning)", fontWeight: 600 }}>"{flag.original}"</span>
+        <span style={{ fontSize: 12, color: "var(--text-muted)", margin: "0 6px" }}>→</span>
+        <span style={{ fontSize: 12, color: "var(--text-secondary)" }}>{flag.replacement}</span>
       </div>
-      <div style={flagReplacementRowStyle}>
-        <span style={arrowStyle}>→</span>
-        <input type="text" value={flag.replacement}
-          onChange={(e) => onEditReplacement(flag.id, e.target.value)}
-          disabled={!flag.enabled}
-          style={{ ...replacementInputStyle, color: flag.enabled ? "var(--text-primary)" : "var(--text-muted)" }} />
-      </div>
+      <button onClick={() => onAccept(flag)} style={acceptBtnStyle}>Accept</button>
     </div>
   );
 }
@@ -387,7 +404,7 @@ function ToggleSwitch({ label, checked, onChange }: { label: string; checked: bo
       <span role="switch" aria-checked={checked} tabIndex={0}
         onClick={() => onChange(!checked)}
         onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onChange(!checked); } }}
-        style={{ ...trackStyle, backgroundColor: checked ? "var(--accent)" : "var(--bg-input)" }}>
+        style={{ ...trackStyle, backgroundColor: checked ? "var(--accent)" : "var(--border-light)" }}>
         <span style={{ ...thumbStyle, transform: checked ? "translateX(18px)" : "translateX(2px)" }} />
       </span>
       <span style={{ fontSize: 13, color: "var(--text-secondary)" }}>{label}</span>
@@ -395,167 +412,161 @@ function ToggleSwitch({ label, checked, onChange }: { label: string; checked: bo
   );
 }
 
+/* ---------- Helpers ---------- */
+
+function escapeRegExpLocal(str: string): string {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 /* ---------- Styles ---------- */
 
 const centeredStyle: React.CSSProperties = { maxWidth: 720, margin: "0 auto", padding: "48px 24px" };
-
-const pageStyle: React.CSSProperties = { maxWidth: 1200, margin: "0 auto", padding: "40px 24px" };
-
-const headerStyle: React.CSSProperties = { marginBottom: 28 };
-
-const headingStyle: React.CSSProperties = {
-  fontSize: 24, fontWeight: 800, color: "var(--text-primary)", margin: 0, letterSpacing: "-0.03em",
-};
-
-const subStyle: React.CSSProperties = { fontSize: 14, color: "var(--text-muted)", margin: "6px 0 0" };
-
-const hintStyle: React.CSSProperties = { fontSize: 12, color: "var(--text-muted)", margin: "4px 0 0", fontStyle: "italic" };
-
-const twoColumnStyle: React.CSSProperties = { display: "flex", gap: 32, alignItems: "flex-start" };
-
-const leftColumnStyle: React.CSSProperties = {
-  flex: "1 1 45%", minWidth: 0, display: "flex", flexDirection: "column", gap: 8,
-  position: "sticky", top: 24,
-};
-
-const rightColumnStyle: React.CSSProperties = {
-  flex: "1 1 55%", minWidth: 300, display: "flex", flexDirection: "column", gap: 20,
-};
-
-const labelStyle: React.CSSProperties = {
-  fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.08em", color: "var(--text-muted)",
-};
-
-const badgeStyle: React.CSSProperties = {
-  fontSize: 10, fontWeight: 700, color: "var(--accent)", backgroundColor: "var(--accent-soft)",
-  padding: "2px 8px", borderRadius: "var(--radius-full)",
-};
+const pageStyle: React.CSSProperties = { maxWidth: 1280, margin: "0 auto", padding: "32px 24px" };
+const headerStyle: React.CSSProperties = { marginBottom: 24 };
+const headingStyle: React.CSSProperties = { fontSize: 22, fontWeight: 800, color: "var(--text-primary)", margin: 0, letterSpacing: "-0.03em" };
+const subStyle: React.CSSProperties = { fontSize: 14, color: "var(--text-muted)", margin: "4px 0 0" };
+const hintStyle: React.CSSProperties = { fontSize: 11, color: "var(--text-muted)", margin: 0, fontStyle: "italic" };
+const twoColumnStyle: React.CSSProperties = { display: "flex", gap: 28, alignItems: "flex-start" };
+const leftColumnStyle: React.CSSProperties = { flex: "1 1 48%", minWidth: 0, display: "flex", flexDirection: "column", gap: 12, position: "sticky", top: 24 };
+const rightColumnStyle: React.CSSProperties = { flex: "1 1 52%", minWidth: 320, display: "flex", flexDirection: "column", gap: 14 };
+const panelHeaderStyle: React.CSSProperties = { display: "flex", alignItems: "center", justifyContent: "space-between" };
+const labelStyle: React.CSSProperties = { fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.08em", color: "var(--text-muted)" };
+const sectionTitleStyle: React.CSSProperties = { fontSize: 15, fontWeight: 700, color: "var(--text-primary)", letterSpacing: "-0.01em" };
+const legendStyle: React.CSSProperties = { display: "flex", alignItems: "center", gap: 8, fontSize: 10, color: "var(--text-muted)" };
+const legendDotTakeaway: React.CSSProperties = { display: "inline-block", width: 8, height: 8, borderRadius: 2, backgroundColor: "rgba(249, 115, 22, 0.15)", border: "1px solid rgba(249, 115, 22, 0.3)" };
 
 const transcriptionBoxStyle: React.CSSProperties = {
-  whiteSpace: "pre-wrap", padding: 20, backgroundColor: "var(--bg-card)", border: "1px solid var(--border)",
-  borderRadius: "var(--radius-md)", fontSize: 14, lineHeight: 1.7, color: "var(--text-secondary)",
-  maxHeight: "70vh", overflowY: "auto",
+  whiteSpace: "pre-wrap", padding: 18, backgroundColor: "var(--bg-card)", border: "1px solid var(--border)",
+  borderRadius: "var(--radius-md)", fontSize: 13, lineHeight: 1.8, color: "var(--text-secondary)",
+  maxHeight: "75vh", overflowY: "auto", boxShadow: "var(--shadow-sm)",
 };
 
-const flagsSectionStyle: React.CSSProperties = {
-  display: "flex", flexDirection: "column", gap: 10,
-  padding: 16, backgroundColor: "var(--bg-card)", border: "1px solid var(--border)",
-  borderRadius: "var(--radius-md)",
+const takeawayHighlightStyle: React.CSSProperties = {
+  backgroundColor: "rgba(249, 115, 22, 0.1)", borderRadius: 3, padding: "1px 2px",
+  fontWeight: 500, color: "var(--text-primary)",
 };
 
-const flagsHeaderStyle: React.CSSProperties = {
-  display: "flex", alignItems: "center", justifyContent: "space-between",
-};
-
-const masterCheckboxStyle: React.CSSProperties = {
-  display: "flex", alignItems: "center", gap: 5, cursor: "pointer",
-};
-
-const flagsListStyle: React.CSSProperties = {
-  display: "flex", flexDirection: "column", gap: 6, maxHeight: "40vh", overflowY: "auto",
-};
-
-const flagItemStyle: React.CSSProperties = {
-  padding: "10px 12px", backgroundColor: "var(--bg-elevated)", border: "1px solid var(--border)",
-  borderRadius: "var(--radius-sm)", transition: "opacity 0.15s ease, border-color 0.15s ease",
-};
-
-const flagTopRowStyle: React.CSSProperties = { display: "flex", alignItems: "center", gap: 8 };
-
-const flagOriginalStyle: React.CSSProperties = { fontSize: 13, fontWeight: 600, color: "var(--accent)" };
-
-const flagReplacementRowStyle: React.CSSProperties = {
-  display: "flex", alignItems: "center", gap: 6, marginTop: 6, marginLeft: 23,
-};
-
-const arrowStyle: React.CSSProperties = { fontSize: 12, color: "var(--text-muted)", flexShrink: 0 };
-
-const replacementInputStyle: React.CSSProperties = {
-  flex: 1, padding: "5px 8px", fontSize: 12, fontFamily: "var(--font)",
-  backgroundColor: "var(--bg-input)", border: "1px solid var(--border-light)",
-  borderRadius: "var(--radius-sm)", outline: "none", transition: "border-color 0.15s ease",
-};
-
-const controlsSectionStyle: React.CSSProperties = {
-  display: "flex", flexDirection: "column", gap: 16,
-  padding: 16, backgroundColor: "var(--bg-card)", border: "1px solid var(--border)",
-  borderRadius: "var(--radius-md)",
-};
-
-const sectionStyle: React.CSSProperties = { display: "flex", flexDirection: "column", gap: 10 };
-
-const toggleRowStyle: React.CSSProperties = { display: "flex", alignItems: "center", gap: 12, cursor: "pointer" };
-
-const trackStyle: React.CSSProperties = {
-  display: "inline-flex", alignItems: "center", width: 40, height: 22, borderRadius: 11,
-  transition: "background-color 0.2s", flexShrink: 0, cursor: "pointer", border: "1px solid var(--border-light)",
-};
-
-const thumbStyle: React.CSSProperties = {
-  width: 18, height: 18, borderRadius: "50%", backgroundColor: "#fff",
-  boxShadow: "0 1px 4px rgba(0,0,0,0.3)", transition: "transform 0.2s",
-};
-
-const generateBtnStyle: React.CSSProperties = {
-  padding: "12px 32px", fontSize: 14, fontWeight: 700, color: "#fff",
+const addNoteBtnStyle: React.CSSProperties = {
+  padding: "10px 20px", fontSize: 13, fontWeight: 700, color: "#fff",
   backgroundColor: "var(--accent)", border: "none", borderRadius: "var(--radius-md)",
-  cursor: "pointer", width: "100%", boxShadow: "0 4px 16px rgba(249,115,22,0.2)",
-  transition: "box-shadow 0.2s ease", letterSpacing: "-0.01em",
+  whiteSpace: "nowrap", boxShadow: "var(--shadow-sm)", transition: "all 0.15s ease",
+  display: "flex", alignItems: "center", gap: 6, width: "100%", justifyContent: "center",
+};
+const chevronStyle: React.CSSProperties = { fontSize: 10, marginLeft: 2, opacity: 0.8 };
+const templateMenuStyle: React.CSSProperties = {
+  position: "absolute", top: "calc(100% + 6px)", left: 0, right: 0,
+  backgroundColor: "var(--bg-card)", border: "1px solid var(--border)",
+  borderRadius: "var(--radius-md)", boxShadow: "var(--shadow-lg)", zIndex: 50, overflow: "hidden",
+};
+const templateMenuItemStyle: React.CSSProperties = {
+  display: "block", width: "100%", padding: "10px 16px",
+  fontSize: 13, fontFamily: "var(--font)", fontWeight: 500,
+  border: "none", cursor: "pointer", textAlign: "left", transition: "background-color 0.1s ease",
 };
 
-const editorPanelStyle: React.CSSProperties = {
-  display: "flex", flexDirection: "column", gap: 16,
+const noteAreaWrapperStyle: React.CSSProperties = {
+  display: "flex", flexDirection: "column",
+  backgroundColor: "var(--bg-card)", border: "1px solid var(--border)",
+  borderRadius: "var(--radius-md)", boxShadow: "var(--shadow-sm)", overflow: "hidden",
 };
-
-const editorWrapperStyle: React.CSSProperties = { position: "relative" };
-
 const textareaStyle: React.CSSProperties = {
-  width: "100%", padding: 20, fontSize: 14, lineHeight: 1.7, fontFamily: "var(--font)",
-  color: "var(--text-primary)", backgroundColor: "var(--bg-card)", border: "1px solid var(--border)",
-  borderRadius: "var(--radius-md)", resize: "vertical", boxSizing: "border-box",
-  outline: "none", transition: "border-color 0.15s ease",
+  width: "100%", padding: 16, fontSize: 13, lineHeight: 1.7, fontFamily: "var(--font)",
+  color: "var(--text-primary)", backgroundColor: "transparent", border: "none",
+  resize: "vertical", boxSizing: "border-box", outline: "none", minHeight: 220,
+};
+const coverageRecsInsideStyle: React.CSSProperties = {
+  borderTop: "1px solid var(--border)", padding: "12px 16px",
+  backgroundColor: "var(--bg-elevated)",
+};
+const coverageRecsLabelStyle: React.CSSProperties = {
+  fontSize: 10, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.08em",
+  color: "var(--info)", marginBottom: 8,
+};
+const coverageRecsListStyle: React.CSSProperties = {
+  display: "flex", flexWrap: "wrap", gap: 6,
+};
+const coverageRecBtnStyle: React.CSSProperties = {
+  padding: "5px 12px", fontSize: 11, fontWeight: 600, fontFamily: "var(--font)",
+  color: "var(--info)", backgroundColor: "var(--info-soft)", border: "1px solid rgba(37, 99, 235, 0.15)",
+  borderRadius: "var(--radius-full)", cursor: "pointer", transition: "all 0.1s ease", whiteSpace: "nowrap",
 };
 
-const highlightOverlayStyle: React.CSSProperties = {
-  position: "absolute", top: 0, left: 0, right: 0, padding: 20,
-  fontSize: 14, lineHeight: 1.7, fontFamily: "var(--font)",
-  pointerEvents: "none", zIndex: 2, whiteSpace: "pre-wrap", wordWrap: "break-word", overflow: "hidden",
-};
-
-const highlightedTextStyle: React.CSSProperties = {
-  backgroundColor: "rgba(249, 115, 22, 0.25)", borderRadius: 3, transition: "background-color 0.3s ease",
-};
-
-const complianceDraftStyle: React.CSSProperties = {
-  padding: 20, backgroundColor: "var(--bg-card)", border: "1px solid var(--border)",
-  borderLeft: "3px solid var(--accent)", borderRadius: "var(--radius-md)",
-  maxHeight: 300, overflowY: "auto",
-};
-
-const complianceLabelStyle: React.CSSProperties = {
-  fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.08em",
-  color: "var(--accent)", marginBottom: 10,
-};
-
-const recsContainerStyle: React.CSSProperties = {
+const togglesSectionStyle: React.CSSProperties = {
   display: "flex", flexDirection: "column", gap: 10,
+  padding: 14, backgroundColor: "var(--bg-card)", border: "1px solid var(--border)",
+  borderRadius: "var(--radius-md)", boxShadow: "var(--shadow-sm)",
+};
+const toggleDividerStyle: React.CSSProperties = {
+  height: 1, backgroundColor: "var(--border)", margin: "4px 0",
+};
+const legalSuggestionsStyle: React.CSSProperties = {
+  display: "flex", flexDirection: "column", gap: 6, maxHeight: "20vh", overflowY: "auto",
+};
+const legalItemStyle: React.CSSProperties = {
+  display: "flex", alignItems: "center", gap: 8,
+  padding: "8px 10px", backgroundColor: "var(--warning-soft)", border: "1px solid rgba(217, 119, 6, 0.15)",
+  borderRadius: "var(--radius-sm)",
+};
+const acceptBtnStyle: React.CSSProperties = {
+  padding: "4px 12px", fontSize: 11, fontWeight: 600, color: "var(--warning)",
+  backgroundColor: "transparent", border: "1px solid var(--warning)",
+  borderRadius: "var(--radius-sm)", cursor: "pointer", whiteSpace: "nowrap",
 };
 
-const recsLabelStyle: React.CSSProperties = {
-  fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.08em", color: "var(--text-muted)",
+const toggleRowStyle: React.CSSProperties = { display: "flex", alignItems: "center", gap: 10, cursor: "pointer" };
+const trackStyle: React.CSSProperties = {
+  display: "inline-flex", alignItems: "center", width: 38, height: 20, borderRadius: 10,
+  transition: "background-color 0.2s", flexShrink: 0, cursor: "pointer", border: "1px solid var(--border)",
 };
-
-const recsListStyle: React.CSSProperties = {
-  display: "flex", flexDirection: "column", gap: 6,
-};
-
-const gapPanelWrapperStyle: React.CSSProperties = {
-  maxHeight: "40vh", overflowY: "auto",
+const thumbStyle: React.CSSProperties = {
+  width: 16, height: 16, borderRadius: "50%", backgroundColor: "#fff",
+  boxShadow: "0 1px 3px rgba(0,0,0,0.2)", transition: "transform 0.2s",
 };
 
 const finalizeBtnStyle: React.CSSProperties = {
-  padding: "14px 32px", fontSize: 14, fontWeight: 700, color: "#fff",
+  padding: "12px 28px", fontSize: 14, fontWeight: 700, color: "#fff",
   backgroundColor: "var(--accent)", border: "none", borderRadius: "var(--radius-md)",
-  cursor: "pointer", width: "100%", boxShadow: "0 4px 16px rgba(249,115,22,0.2)",
-  transition: "box-shadow 0.2s ease", letterSpacing: "-0.01em",
+  width: "100%", boxShadow: "0 4px 12px rgba(249,115,22,0.15)",
+  transition: "all 0.2s ease", letterSpacing: "-0.01em",
+};
+
+/* ---------- Modal Styles ---------- */
+
+const modalOverlayStyle: React.CSSProperties = {
+  position: "fixed", inset: 0, backgroundColor: "rgba(0, 0, 0, 0.4)",
+  display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000,
+  backdropFilter: "blur(4px)",
+};
+const modalContentStyle: React.CSSProperties = {
+  display: "flex", flexDirection: "column", gap: 20,
+  padding: 28, backgroundColor: "var(--bg-card)", border: "1px solid var(--border)",
+  borderRadius: "var(--radius-lg)", maxWidth: 480, width: "90%",
+  boxShadow: "0 20px 60px rgba(0, 0, 0, 0.15)",
+};
+const modalTitleStyle: React.CSSProperties = {
+  margin: 0, fontSize: 18, fontWeight: 700, color: "var(--text-primary)", letterSpacing: "-0.02em",
+};
+const modalSectionStyle: React.CSSProperties = {
+  display: "flex", flexDirection: "column", gap: 10,
+};
+const modalSectionLabelStyle: React.CSSProperties = {
+  fontSize: 13, fontWeight: 600, color: "var(--text-primary)",
+};
+const modalBodyStyle: React.CSSProperties = {
+  margin: 0, fontSize: 13, color: "var(--text-secondary)", lineHeight: 1.6,
+};
+const modalCheckboxRowStyle: React.CSSProperties = {
+  display: "flex", alignItems: "center", gap: 10, cursor: "pointer",
+};
+const modalCheckboxStyle: React.CSSProperties = {
+  width: 16, height: 16, accentColor: "var(--accent)", cursor: "pointer",
+};
+const modalDividerStyle: React.CSSProperties = {
+  height: 1, backgroundColor: "var(--border)",
+};
+const modalSubmitBtnStyle: React.CSSProperties = {
+  padding: "12px 28px", fontSize: 14, fontWeight: 700, color: "#fff",
+  backgroundColor: "var(--accent)", border: "none", borderRadius: "var(--radius-md)",
+  width: "100%", boxShadow: "0 4px 12px rgba(249,115,22,0.15)",
+  transition: "all 0.2s ease", letterSpacing: "-0.01em",
 };

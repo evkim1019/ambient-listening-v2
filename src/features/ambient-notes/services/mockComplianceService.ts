@@ -79,5 +79,28 @@ export function getComplianceMappings(): ComplianceMapping[] {
 }
 
 function escapeRegExp(str: string): string {
-  return str.replace(/[.*+?^${}()|[\]\\]/g, String.raw`\$&`);
+  return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+/** Scan note text and return compliance flags only for terms found in the note. */
+export function scanNoteForLegalFlags(noteText: string): ComplianceFlag[] {
+  const flags: ComplianceFlag[] = [];
+  const lowerText = noteText.toLowerCase();
+  let idCounter = 0;
+  const sorted = [...COMPLIANCE_MAPPINGS].sort((a, b) => b.original.length - a.original.length);
+  for (const mapping of sorted) {
+    if (lowerText.includes(mapping.original.toLowerCase())) {
+      const alreadyCovered = flags.some(
+        (f) => f.original.toLowerCase().includes(mapping.original.toLowerCase()) && f.original !== mapping.original
+      );
+      if (!alreadyCovered) {
+        flags.push({
+          id: `note-flag-${idCounter++}`,
+          original: mapping.original,
+          replacement: mapping.replacement,
+          enabled: true,
+        });
+      }
+    }
+  }
+  return flags;
 }
