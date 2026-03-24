@@ -1,10 +1,12 @@
 import { useEffect, useState } from "react";
+import { BrowserRouter, Routes, Route } from "react-router-dom";
 import type { Schema } from "../amplify/data/resource";
 import { generateClient } from "aws-amplify/data";
+import AmbientNotesRoutes from "./features/ambient-notes/routes";
 
 const client = generateClient<Schema>();
 
-function App() {
+function TodoApp() {
   const [todos, setTodos] = useState<Array<Schema["Todo"]["type"]>>([]);
 
   useEffect(() => {
@@ -34,6 +36,17 @@ function App() {
         </a>
       </div>
     </main>
+  );
+}
+
+function App() {
+  return (
+    <BrowserRouter>
+      <Routes>
+        <Route path="/" element={<TodoApp />} />
+        <Route path="/ambient-notes/*" element={<AmbientNotesRoutes />} />
+      </Routes>
+    </BrowserRouter>
   );
 }
 
